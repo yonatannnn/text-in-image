@@ -14,14 +14,12 @@ from pymongo import MongoClient
 from pymongo.collection import Collection
 from telegram import Update
 from telegram.ext import (
-    Application,
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
-
 
 load_dotenv()
 
@@ -39,6 +37,7 @@ def get_env(name: str, default: Optional[str] = None) -> str:
     return value
 
 
+# --- ENV ---
 BOT_TOKEN = get_env("BOT_TOKEN")
 MONGODB_URI = get_env("MONGODB_URI", "mongodb://localhost:27017")
 DB_NAME = get_env("DB_NAME", "secret_image_bot")
@@ -48,6 +47,7 @@ SECRET_KEY = get_env("SECRET_KEY")
 cipher = Fernet(SECRET_KEY)
 
 
+# --- Encryption / Decryption ---
 def encrypt(text: str) -> str:
     return cipher.encrypt(text.encode()).decode()
 
@@ -56,12 +56,14 @@ def decrypt(token: str) -> str:
     return cipher.decrypt(token.encode()).decode()
 
 
+# --- Image hash ---
 def compute_image_hash(image_bytes: bytes) -> str:
     """Compute a perceptual hash that survives renames and minor compression."""
     img = Image.open(BytesIO(image_bytes)).convert("RGB")
     return str(imagehash.phash(img))
 
 
+# --- Password hashing ---
 def hash_password(password: str) -> bytes:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt())
 
@@ -70,6 +72,7 @@ def verify_password(password: str, hashed: bytes) -> bool:
     return bcrypt.checkpw(password.encode(), hashed)
 
 
+# --- MongoDB ---
 def get_collection() -> Collection:
     client = MongoClient(MONGODB_URI)
     db = client[DB_NAME]
@@ -79,6 +82,7 @@ def get_collection() -> Collection:
 collection = get_collection()
 
 
+# --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🖼️ Send me an image.\n"
@@ -93,19 +97,16 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     photo = update.message.photo[-1]
     tg_file = await photo.get_file()
-
     image_bytes = await tg_file.download_as_bytearray()
     image_hash = compute_image_hash(image_bytes)
 
     record = collection.find_one({"image_hash": image_hash})
 
     if record:
+        # Existing image → reveal
         context.user_data.pop("pending_new", None)
-        context.user_data.pop("pending_new_password", None)
         context.user_data.pop("pending_update", None)
-        context.user_data.pop("pending_update_password", None)
 
-        # Reveal flow
         reply_lines = []
         if record.get("password_hash"):
             context.user_data["pending_reveal"] = record
@@ -114,10 +115,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             try:
                 secret = decrypt(record["message"])
             except (KeyError, InvalidToken):
-                await update.message.reply_text(
-                    "⚠️ Found a message but failed to decrypt it. "
-                    "Please verify the SECRET_KEY."
-                )
+                await update.message.reply_text("⚠️ Found a message but failed to decrypt it. Check SECRET_KEY.")
                 return
             reply_lines.append(f"🔓 Hidden message:\n\n{secret}")
 
@@ -130,14 +128,17 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if reply_lines:
             await update.message.reply_text("\n".join(reply_lines))
     else:
-        context.user_data["pending_new"] = {
+        # New image → ask for secret
+        if "pending_new" not in context.user_data:
+            context.user_data["pending_new"] = {}
+        context.user_data["pending_new"][image_hash] = {
             "hash": image_hash,
             "image": bytes(image_bytes),
             "owner_id": update.message.from_user.id if update.message.from_user else None,
+            "encrypted": None,
         }
         await update.message.reply_text(
-            "📝 What message do you want to hide in this image?\n"
-            "You can /cancel anytime."
+            "📝 What message do you want to hide in this image?\nYou can /cancel anytime."
         )
 
 
@@ -145,15 +146,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not update.message:
         return
 
-    text = update.message.text
+    text = update.message.text.strip()
 
-    # Cancel command
-    if text.strip().lower() == "/cancel":
+    # Cancel
+    if text.lower() == "/cancel":
         context.user_data.clear()
         await update.message.reply_text("❌ Cancelled.")
         return
 
-    # Reveal with password
+    # --- Reveal ---
     if "pending_reveal" in context.user_data:
         record = context.user_data.pop("pending_reveal")
         password_hash = record.get("password_hash")
@@ -164,29 +165,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             secret = decrypt(record["message"])
         except (KeyError, InvalidToken):
-            await update.message.reply_text(
-                "⚠️ Found a message but failed to decrypt it. Please verify the SECRET_KEY."
-            )
+            await update.message.reply_text("⚠️ Found a message but failed to decrypt it. Check SECRET_KEY.")
             return
         await update.message.reply_text(f"🔓 Hidden message:\n\n{secret}")
         return
 
-    # Update flow (owner)
+    # --- Owner update ---
     if "pending_update_password" in context.user_data:
         payload = context.user_data.pop("pending_update_password")
-        new_password_raw = text.strip()
-        password_hash = (
-            hash_password(new_password_raw) if new_password_raw and new_password_raw != "-" else None
-        )
+        password_raw = text
+        password_hash = hash_password(password_raw) if password_raw != "-" else None
         collection.update_one(
             {"_id": payload["record_id"]},
-            {
-                "$set": {
-                    "message": payload["encrypted"],
-                    "password_hash": password_hash,
-                    "updated_at": datetime.utcnow(),
-                }
-            },
+            {"$set": {
+                "message": payload["encrypted"],
+                "password_hash": password_hash,
+                "updated_at": datetime.utcnow(),
+            }}
         )
         await update.message.reply_text("✅ Secret updated for this image.")
         return
@@ -201,60 +196,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "record_id": record["_id"],
                 "encrypted": encrypted,
             }
-            await update.message.reply_text(
-                "🔐 Set a password for this image (send '-' for none):"
-            )
+            await update.message.reply_text("🔐 Set a password for this image (send '-' for none):")
         else:
             await update.message.reply_text("⚠️ Only the owner can update this secret.")
         return
 
-    # New image flow
-    if "pending_new_password" in context.user_data:
-        payload = context.user_data.pop("pending_new_password")
-        password_raw = text.strip()
-        password_hash = hash_password(password_raw) if password_raw and password_raw != "-" else None
-        collection.insert_one(
-            {
+    # --- New image flow ---
+    if "pending_new" in context.user_data:
+        # Get last pending image
+        pending_hash = list(context.user_data["pending_new"].keys())[-1]
+        payload = context.user_data["pending_new"][pending_hash]
+
+        if not payload["encrypted"]:
+            # First text → secret
+            payload["encrypted"] = encrypt(text)
+            await update.message.reply_text("🔐 Set a password for this image (send '-' for none):")
+            return
+        else:
+            # Second text → password
+            password_raw = text
+            password_hash = hash_password(password_raw) if password_raw != "-" else None
+            collection.insert_one({
                 "image_hash": payload["hash"],
                 "message": payload["encrypted"],
                 "image": Binary(payload["image"]),
                 "owner_id": payload["owner_id"],
                 "password_hash": password_hash,
                 "created_at": datetime.utcnow(),
-            }
-        )
-        await update.message.reply_text(
-            "✅ Secret saved!\nSend this image again anytime to reveal it."
-        )
-        return
-
-    if "pending_new" in context.user_data:
-        pending = context.user_data.pop("pending_new")
-        secret = text
-        encrypted = encrypt(secret)
-        context.user_data["pending_new_password"] = {
-            "hash": pending["hash"],
-            "image": pending["image"],
-            "owner_id": pending["owner_id"],
-            "encrypted": encrypted,
-        }
-        await update.message.reply_text(
-            "🔐 Set a password for this image (send '-' for none):"
-        )
-        return
-
-    # Otherwise ignore text
-    return
+            })
+            context.user_data["pending_new"].pop(pending_hash)
+            await update.message.reply_text("✅ Secret saved! Send this image again anytime to reveal it.")
+            return
 
 
-def build_app() -> Application:
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .rate_limiter(None)
-        .build()
-    )
-
+# --- Build app ---
+def build_app() -> ApplicationBuilder:
+    app = ApplicationBuilder().token(BOT_TOKEN).rate_limiter(None).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, handle_image))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
@@ -269,4 +246,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
