@@ -1,8 +1,9 @@
 python-telegram-bot
+fastapi
+uvicorn
 pillow
 ImageHash
 pymongo
 cryptography
 python-dotenv
 bcrypt
-
