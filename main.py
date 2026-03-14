@@ -1,7 +1,5 @@
 import logging
 import os
-import threading
-import http.server
 from datetime import datetime
 from io import BytesIO
 from typing import Optional
@@ -240,29 +238,8 @@ def build_app() -> ApplicationBuilder:
     return app
 
 
-class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    def log_message(self, format, *args):
-        return
-
-
-def run_health_server() -> None:
-    port = int(os.environ.get("PORT", 8000))
-    server = http.server.HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    logger.info(f"Health check server started on port {port}")
-    server.serve_forever()
-
-
-def main() -> None:
-    threading.Thread(target=run_health_server, daemon=True).start()
-    app = build_app()
-    logger.info("Bot is starting...")
-    app.run_polling()
-
-
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        "This bot runs via webhooks. Start the server with: "
+        "uvicorn app:app --host 0.0.0.0 --port 8000"
+    )

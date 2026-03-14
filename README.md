@@ -23,9 +23,13 @@ Telegram bot that ties hidden messages to an image's perceptual hash. The same i
    SECRET_KEY=your_base64_fernet_key
    ```
    - Generate `SECRET_KEY`: `python - <<'PY'\nfrom cryptography.fernet import Fernet\nprint(Fernet.generate_key().decode())\nPY`
-4) Run the bot:
+4) Run the webhook server:
    ```bash
-   python main.py
+   uvicorn app:app --host 0.0.0.0 --port 8000
+   ```
+5) Point Telegram to your webhook URL (replace with your domain):
+   ```bash
+   curl "https://api.telegram.org/bot$BOT_TOKEN/setWebhook?url=https://YOUR_DOMAIN/api/telegram"
    ```
 
 ## Commands & flow
@@ -40,4 +44,3 @@ Telegram bot that ties hidden messages to an image's perceptual hash. The same i
 - Screenshots can alter the hash; to handle near-matches later, add Hamming-distance tolerance.
 - Store `SECRET_KEY` securely (env/secret manager in production).
 - Each user session currently holds only one pending hash at a time (per Telegram user_data).
-
